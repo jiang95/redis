@@ -777,8 +777,8 @@ int streamDeleteItem(stream *s, streamID *id) {
  * in the standard <ms>-<seq> format, using the simple string protocol
  * of REPL. */
 void addReplyStreamID(client *c, streamID *id) {
-    sds replyid = sdscatfmt(sdsempty(),"+%U-%U\r\n",id->ms,id->seq);
-    addReplySds(c,replyid);
+    sds replyid = sdscatfmt(sdsempty(),"%U-%U",id->ms,id->seq);
+    addReplyBulkSds(c,replyid);
 }
 
 /* Similar to the above function, but just creates an object, usually useful
@@ -1683,13 +1683,14 @@ uint64_t streamDelConsumer(streamCG *cg, sds name) {
  * Consumer groups commands
  * ----------------------------------------------------------------------- */
 
-/* XGROUP CREATE <key> <groupname> <id or $>
+/* XGROUP CREATE <key> <groupname> <id or $> [MKSTREAM]
  * XGROUP SETID <key> <groupname> <id or $>
  * XGROUP DESTROY <key> <groupname>
  * XGROUP DELCONSUMER <key> <groupname> <consumername> */
 void xgroupCommand(client *c) {
     const char *help[] = {
-"CREATE      <key> <groupname> <id or $>  -- Create a new consumer group.",
+"CREATE      <key> <groupname> <id or $> [opt] -- Create a new consumer group.",
+"            option MKSTREAM: create the empty stream if it does not exist.",
 "SETID       <key> <groupname> <id or $>  -- Set the current group ID.",
 "DESTROY     <key> <groupname>            -- Remove the specified group.",
 "DELCONSUMER <key> <groupname> <consumer> -- Remove the specified consumer.",
@@ -1700,13 +1701,39 @@ NULL
     sds grpname = NULL;
     streamCG *cg = NULL;
     char *opt = c->argv[1]->ptr; /* Subcommand name. */
+    int mkstream = 0;
+    robj *o;
 
-    /* Lookup the key now, this is common for all the subcommands but HELP. */
-    if (c->argc >= 4) {
-        robj *o = lookupKeyWriteOrReply(c,c->argv[2],shared.nokeyerr);
-        if (o == NULL || checkType(c,o,OBJ_STREAM)) return;
-        s = o->ptr;
+    /* CREATE has an MKSTREAM option that creates the stream if it
+     * does not exist. */
+    if (c->argc == 6 && !strcasecmp(opt,"CREATE")) {
+        if (strcasecmp(c->argv[5]->ptr,"MKSTREAM")) {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+        mkstream = 1;
         grpname = c->argv[3]->ptr;
+    }
+
+    /* Everything but the "HELP" option requires a key and group name. */
+    if (c->argc >= 4) {
+        o = lookupKeyWrite(c->db,c->argv[2]);
+        if (o) s = o->ptr;
+        grpname = c->argv[3]->ptr;
+    }
+
+    /* Check for missing key/group. */
+    if (c->argc >= 4 && !mkstream) {
+        /* At this point key must exist, or there is an error. */
+        if (o == NULL) {
+            addReplyError(c,
+                "The XGROUP subcommand requires the key to exist. "
+                "Note that for CREATE you may want to use the MKSTREAM "
+                "option to create an empty stream automatically.");
+            return;
+        }
+
+        if (checkType(c,o,OBJ_STREAM)) return;
 
         /* Certain subcommands require the group to exist. */
         if ((cg = streamLookupCG(s,grpname)) == NULL &&
@@ -1721,13 +1748,26 @@ NULL
     }
 
     /* Dispatch the different subcommands. */
-    if (!strcasecmp(opt,"CREATE") && c->argc == 5) {
+    if (!strcasecmp(opt,"CREATE") && (c->argc == 5 || c->argc == 6)) {
         streamID id;
         if (!strcmp(c->argv[4]->ptr,"$")) {
-            id = s->last_id;
+            if (s) {
+                id = s->last_id;
+            } else {
+                id.ms = 0;
+                id.seq = 0;
+            }
         } else if (streamParseStrictIDOrReply(c,c->argv[4],&id,0) != C_OK) {
             return;
         }
+
+        /* Handle the MKSTREAM option now that the command can no longer fail. */
+        if (s == NULL && mkstream) {
+            o = createStreamObject();
+            dbAdd(c->db,c->argv[2],o);
+            s = o->ptr;
+        }
+
         streamCG *cg = streamCreateCG(s,grpname,sdslen(grpname),&id);
         if (cg) {
             addReply(c,shared.ok);
@@ -1773,6 +1813,38 @@ NULL
     } else {
         addReplySubcommandSyntaxError(c);
     }
+}
+
+/* Set the internal "last ID" of a stream. */
+void xsetidCommand(client *c) {
+    robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nokeyerr);
+    if (o == NULL || checkType(c,o,OBJ_STREAM)) return;
+
+    stream *s = o->ptr;
+    streamID id;
+    if (streamParseStrictIDOrReply(c,c->argv[2],&id,0) != C_OK) return;
+
+    /* If the stream has at least one item, we want to check that the user
+     * is setting a last ID that is equal or greater than the current top
+     * item, otherwise the fundamental ID monotonicity assumption is violated. */
+    if (s->length > 0) {
+        streamID maxid;
+        streamIterator si;
+        streamIteratorStart(&si,s,NULL,NULL,1);
+        int64_t numfields;
+        streamIteratorGetID(&si,&maxid,&numfields);
+        streamIteratorStop(&si);
+
+        if (streamCompareID(&id,&maxid) < 0) {
+            addReplyError(c,"The ID specified in XSETID is smaller than the "
+                            "target stream top item");
+            return;
+        }
+    }
+    s->last_id = id;
+    addReply(c,shared.ok);
+    server.dirty++;
+    notifyKeyspaceEvent(NOTIFY_STREAM,"xsetid",c->argv[1],c->db->id);
 }
 
 /* XACK <key> <group> <id> <id> ... <id>
@@ -2384,11 +2456,11 @@ NULL
             if (idle < 0) idle = 0;
 
             addReplyMultiBulkLen(c,6);
-            addReplyStatus(c,"name");
+            addReplyBulkCString(c,"name");
             addReplyBulkCBuffer(c,consumer->name,sdslen(consumer->name));
-            addReplyStatus(c,"pending");
+            addReplyBulkCString(c,"pending");
             addReplyLongLong(c,raxSize(consumer->pel));
-            addReplyStatus(c,"idle");
+            addReplyBulkCString(c,"idle");
             addReplyLongLong(c,idle);
         }
         raxStop(&ri);
@@ -2406,28 +2478,28 @@ NULL
         while(raxNext(&ri)) {
             streamCG *cg = ri.data;
             addReplyMultiBulkLen(c,8);
-            addReplyStatus(c,"name");
+            addReplyBulkCString(c,"name");
             addReplyBulkCBuffer(c,ri.key,ri.key_len);
-            addReplyStatus(c,"consumers");
+            addReplyBulkCString(c,"consumers");
             addReplyLongLong(c,raxSize(cg->consumers));
-            addReplyStatus(c,"pending");
+            addReplyBulkCString(c,"pending");
             addReplyLongLong(c,raxSize(cg->pel));
-            addReplyStatus(c,"last-delivered-id");
+            addReplyBulkCString(c,"last-delivered-id");
             addReplyStreamID(c,&cg->last_id);
         }
         raxStop(&ri);
     } else if (!strcasecmp(opt,"STREAM") && c->argc == 3) {
         /* XINFO STREAM <key> (or the alias XINFO <key>). */
         addReplyMultiBulkLen(c,14);
-        addReplyStatus(c,"length");
+        addReplyBulkCString(c,"length");
         addReplyLongLong(c,s->length);
-        addReplyStatus(c,"radix-tree-keys");
+        addReplyBulkCString(c,"radix-tree-keys");
         addReplyLongLong(c,raxSize(s->rax));
-        addReplyStatus(c,"radix-tree-nodes");
+        addReplyBulkCString(c,"radix-tree-nodes");
         addReplyLongLong(c,s->rax->numnodes);
-        addReplyStatus(c,"groups");
+        addReplyBulkCString(c,"groups");
         addReplyLongLong(c,s->cgroups ? raxSize(s->cgroups) : 0);
-        addReplyStatus(c,"last-generated-id");
+        addReplyBulkCString(c,"last-generated-id");
         addReplyStreamID(c,&s->last_id);
 
         /* To emit the first/last entry we us the streamReplyWithRange()
@@ -2436,11 +2508,11 @@ NULL
         streamID start, end;
         start.ms = start.seq = 0;
         end.ms = end.seq = UINT64_MAX;
-        addReplyStatus(c,"first-entry");
+        addReplyBulkCString(c,"first-entry");
         count = streamReplyWithRange(c,s,&start,&end,1,0,NULL,NULL,
                                      STREAM_RWR_RAWENTRIES,NULL);
         if (!count) addReply(c,shared.nullbulk);
-        addReplyStatus(c,"last-entry");
+        addReplyBulkCString(c,"last-entry");
         count = streamReplyWithRange(c,s,&start,&end,1,1,NULL,NULL,
                                      STREAM_RWR_RAWENTRIES,NULL);
         if (!count) addReply(c,shared.nullbulk);
