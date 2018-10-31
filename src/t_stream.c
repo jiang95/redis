@@ -849,7 +849,7 @@ void streamPropagateGroupID(client *c, robj *key, streamCG *group, robj *groupna
 
 /* Send the specified range to the client 'c'. The range the client will
  * receive is between start and end inclusive, if 'count' is non zero, no more
- * than 'count' elemnets are sent. The 'end' pointer can be NULL to mean that
+ * than 'count' elements are sent. The 'end' pointer can be NULL to mean that
  * we want all the elements from 'start' till the end of the stream. If 'rev'
  * is non zero, elements are produced in reversed order from end to start.
  *
@@ -1260,7 +1260,7 @@ void xrangeGenericCommand(client *c, int rev) {
     robj *o;
     stream *s;
     streamID startid, endid;
-    long long count = 0;
+    long long count = -1;
     robj *startarg = rev ? c->argv[3] : c->argv[2];
     robj *endarg = rev ? c->argv[2] : c->argv[3];
 
@@ -1287,7 +1287,13 @@ void xrangeGenericCommand(client *c, int rev) {
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptymultibulk)) == NULL
         || checkType(c,o,OBJ_STREAM)) return;
     s = o->ptr;
-    streamReplyWithRange(c,s,&startid,&endid,count,rev,NULL,NULL,0,NULL);
+
+    if (count == 0) {
+        addReply(c,shared.nullmultibulk);
+    } else {
+        if (count == -1) count = 0;
+        streamReplyWithRange(c,s,&startid,&endid,count,rev,NULL,NULL,0,NULL);
+    }
 }
 
 /* XRANGE key start end [COUNT <n>] */
@@ -1815,7 +1821,9 @@ NULL
     }
 }
 
-/* Set the internal "last ID" of a stream. */
+/* XSETID <stream> <groupname> <id>
+ *
+ * Set the internal "last ID" of a stream. */
 void xsetidCommand(client *c) {
     robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nokeyerr);
     if (o == NULL || checkType(c,o,OBJ_STREAM)) return;
@@ -1892,7 +1900,7 @@ void xackCommand(client *c) {
     addReplyLongLong(c,acknowledged);
 }
 
-/* XPENDING <key> <group> [<start> <stop> <count>] [<consumer>]
+/* XPENDING <key> <group> [<start> <stop> <count> [<consumer>]]
  *
  * If start and stop are omitted, the command just outputs information about
  * the amount of pending messages for the key/group pair, together with
@@ -1921,6 +1929,7 @@ void xpendingCommand(client *c) {
     if (c->argc >= 6) {
         if (getLongLongFromObjectOrReply(c,c->argv[5],&count,NULL) == C_ERR)
             return;
+        if (count < 0) count = 0;
         if (streamParseIDOrReply(c,c->argv[3],&startid,0) == C_ERR)
             return;
         if (streamParseIDOrReply(c,c->argv[4],&endid,UINT64_MAX) == C_ERR)
