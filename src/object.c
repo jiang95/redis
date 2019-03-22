@@ -415,6 +415,18 @@ int isObjectRepresentableAsLongLong(robj *o, long long *llval) {
     }
 }
 
+/* Optimize the SDS string inside the string object to require little space,
+ * in case there is more than 10% of free space at the end of the SDS
+ * string. This happens because SDS strings tend to overallocate to avoid
+ * wasting too much time in allocations when appending to the string. */
+void trimStringObjectIfNeeded(robj *o) {
+    if (o->encoding == OBJ_ENCODING_RAW &&
+        sdsavail(o->ptr) > sdslen(o->ptr)/10)
+    {
+        o->ptr = sdsRemoveFreeSpace(o->ptr);
+    }
+}
+
 /* Try to encode a string object in order to save space */
 robj *tryObjectEncoding(robj *o) {
     long value;
@@ -484,11 +496,7 @@ robj *tryObjectEncoding(robj *o) {
      * We do that only for relatively large strings as this branch
      * is only entered if the length of the string is greater than
      * OBJ_ENCODING_EMBSTR_SIZE_LIMIT. */
-    if (o->encoding == OBJ_ENCODING_RAW &&
-        sdsavail(s) > len/10)
-    {
-        o->ptr = sdsRemoveFreeSpace(o->ptr);
-    }
+    trimStringObjectIfNeeded(o);
 
     /* Return the original object. */
     return o;
@@ -1191,7 +1199,7 @@ sds getMemoryDoctorReport(void) {
 
 /* Set the object LRU/LFU depending on server.maxmemory_policy.
  * The lfu_freq arg is only relevant if policy is MAXMEMORY_FLAG_LFU.
- * The lru_idle and lru_clock args are only relevant if policy 
+ * The lru_idle and lru_clock args are only relevant if policy
  * is MAXMEMORY_FLAG_LRU.
  * Either or both of them may be <0, in that case, nothing is set. */
 void objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
@@ -1202,16 +1210,20 @@ void objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
             val->lru = (LFUGetTimeInMinutes()<<8) | lfu_freq;
         }
     } else if (lru_idle >= 0) {
-        /* Serialized LRU idle time is in seconds. Scale
+        /* Provided LRU idle time is in seconds. Scale
          * according to the LRU clock resolution this Redis
          * instance was compiled with (normally 1000 ms, so the
          * below statement will expand to lru_idle*1000/1000. */
         lru_idle = lru_idle*1000/LRU_CLOCK_RESOLUTION;
-        val->lru = lru_clock - lru_idle;
-        /* If the lru field overflows (since LRU it is a wrapping
-         * clock), the best we can do is to provide the maximum
-         * representable idle time. */
-        if (val->lru < 0) val->lru = lru_clock+1;
+        long lru_abs = lru_clock - lru_idle; /* Absolute access time. */
+        /* If the LRU field underflows (since LRU it is a wrapping
+         * clock), the best we can do is to provide a large enough LRU
+         * that is half-way in the circlular LRU clock we use: this way
+         * the computed idle time for this object will stay high for quite
+         * some time. */
+        if (lru_abs < 0)
+            lru_abs = (lru_clock+(LRU_CLOCK_MAX/2)) % LRU_CLOCK_MAX;
+        val->lru = lru_abs;
     }
 }
 
@@ -1248,15 +1260,15 @@ NULL
         };
         addReplyHelp(c, help);
     } else if (!strcasecmp(c->argv[1]->ptr,"refcount") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
                 == NULL) return;
         addReplyLongLong(c,o->refcount);
     } else if (!strcasecmp(c->argv[1]->ptr,"encoding") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
                 == NULL) return;
         addReplyBulkCString(c,strEncoding(o->encoding));
     } else if (!strcasecmp(c->argv[1]->ptr,"idletime") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
                 == NULL) return;
         if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
             addReplyError(c,"An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
@@ -1264,7 +1276,7 @@ NULL
         }
         addReplyLongLong(c,estimateObjectIdleTime(o)/1000);
     } else if (!strcasecmp(c->argv[1]->ptr,"freq") && c->argc == 3) {
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.null[c->resp]))
                 == NULL) return;
         if (!(server.maxmemory_policy & MAXMEMORY_FLAG_LFU)) {
             addReplyError(c,"An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.");
@@ -1285,9 +1297,18 @@ NULL
  *
  * Usage: MEMORY usage <key> */
 void memoryCommand(client *c) {
-    robj *o;
-
-    if (!strcasecmp(c->argv[1]->ptr,"usage") && c->argc >= 3) {
+    if (!strcasecmp(c->argv[1]->ptr,"help") && c->argc == 2) {
+        const char *help[] = {
+"DOCTOR - Return memory problems reports.",
+"MALLOC-STATS -- Return internal statistics report from the memory allocator.",
+"PURGE -- Attempt to purge dirty pages for reclamation by the allocator.",
+"STATS -- Return information about the memory usage of the server.",
+"USAGE <key> [SAMPLES <count>] -- Return memory in bytes used by <key> and its value. Nested values are sampled up to <count> times (default: 5).",
+NULL
+        };
+        addReplyHelp(c, help);
+    } else if (!strcasecmp(c->argv[1]->ptr,"usage") && c->argc >= 3) {
+        dictEntry *de;
         long long samples = OBJ_COMPUTE_SIZE_DEF_SAMPLES;
         for (int j = 3; j < c->argc; j++) {
             if (!strcasecmp(c->argv[j]->ptr,"samples") &&
@@ -1306,16 +1327,18 @@ void memoryCommand(client *c) {
                 return;
             }
         }
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
-                == NULL) return;
-        size_t usage = objectComputeSize(o,samples);
-        usage += sdsAllocSize(c->argv[2]->ptr);
+        if ((de = dictFind(c->db->dict,c->argv[2]->ptr)) == NULL) {
+            addReplyNull(c);
+            return;
+        }
+        size_t usage = objectComputeSize(dictGetVal(de),samples);
+        usage += sdsAllocSize(dictGetKey(de));
         usage += sizeof(dictEntry);
         addReplyLongLong(c,usage);
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
-        addReplyMultiBulkLen(c,(25+mh->num_dbs)*2);
+        addReplyMapLen(c,25+mh->num_dbs);
 
         addReplyBulkCString(c,"peak.allocated");
         addReplyLongLong(c,mh->peak_allocated);
@@ -1345,7 +1368,7 @@ void memoryCommand(client *c) {
             char dbname[32];
             snprintf(dbname,sizeof(dbname),"db.%zd",mh->db[j].dbid);
             addReplyBulkCString(c,dbname);
-            addReplyMultiBulkLen(c,4);
+            addReplyMapLen(c,2);
 
             addReplyBulkCString(c,"overhead.hashtable.main");
             addReplyLongLong(c,mh->db[j].overhead_ht_main);
@@ -1434,19 +1457,7 @@ void memoryCommand(client *c) {
         addReply(c, shared.ok);
         /* Nothing to do for other allocators. */
 #endif
-    } else if (!strcasecmp(c->argv[1]->ptr,"help") && c->argc == 2) {
-        addReplyMultiBulkLen(c,5);
-        addReplyBulkCString(c,
-"MEMORY DOCTOR                        - Outputs memory problems report");
-        addReplyBulkCString(c,
-"MEMORY USAGE <key> [SAMPLES <count>] - Estimate memory usage of key");
-        addReplyBulkCString(c,
-"MEMORY STATS                         - Show memory usage details");
-        addReplyBulkCString(c,
-"MEMORY PURGE                         - Ask the allocator to release memory");
-        addReplyBulkCString(c,
-"MEMORY MALLOC-STATS                  - Show allocator internal stats");
     } else {
-        addReplyError(c,"Syntax error. Try MEMORY HELP");
+        addReplyErrorFormat(c, "Unknown subcommand or wrong number of arguments for '%s'. Try MEMORY HELP", (char*)c->argv[1]->ptr);
     }
 }

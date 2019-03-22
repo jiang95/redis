@@ -263,7 +263,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
          * or are already in sync with the master. */
 
         /* Add the multi bulk length. */
-        addReplyMultiBulkLen(slave,argc);
+        addReplyArrayLen(slave,argc);
 
         /* Finally any additional argument that was not stored inside the
          * static buffer if any (from j to argc). */
@@ -296,7 +296,7 @@ void replicationFeedSlavesFromMasterStream(list *slaves, char *buf, size_t bufle
 
         /* Don't feed slaves that are still waiting for BGSAVE to start */
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) continue;
-        addReplyString(slave,buf,buflen);
+        addReplyProto(slave,buf,buflen);
     }
 }
 
@@ -1080,6 +1080,7 @@ void replicationCreateMasterClient(int fd, int dbid) {
     server.master->authenticated = 1;
     server.master->reploff = server.master_initial_offset;
     server.master->read_reploff = server.master->reploff;
+    server.master->user = NULL; /* This client can do everything. */
     memcpy(server.master->replid, server.master_replid,
         sizeof(server.master_replid));
     /* If master offset is set to -1, this master is old and is not
@@ -1089,14 +1090,23 @@ void replicationCreateMasterClient(int fd, int dbid) {
     if (dbid != -1) selectDb(server.master,dbid);
 }
 
-void restartAOF() {
-    int retry = 10;
-    while (retry-- && startAppendOnly() == C_ERR) {
-        serverLog(LL_WARNING,"Failed enabling the AOF after successful master synchronization! Trying it again in one second.");
+/* This function will try to re-enable the AOF file after the
+ * master-replica synchronization: if it fails after multiple attempts
+ * the replica cannot be considered reliable and exists with an
+ * error. */
+void restartAOFAfterSYNC() {
+    unsigned int tries, max_tries = 10;
+    for (tries = 0; tries < max_tries; ++tries) {
+        if (startAppendOnly() == C_OK) break;
+        serverLog(LL_WARNING,
+            "Failed enabling the AOF after successful master synchronization! "
+            "Trying it again in one second.");
         sleep(1);
     }
-    if (!retry) {
-        serverLog(LL_WARNING,"FATAL: this replica instance finished the synchronization with its master, but the AOF can't be turned on. Exiting now.");
+    if (tries == max_tries) {
+        serverLog(LL_WARNING,
+            "FATAL: this replica instance finished the synchronization with "
+            "its master, but the AOF can't be turned on. Exiting now.");
         exit(1);
     }
 }
@@ -1245,8 +1255,20 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (eof_reached) {
         int aof_is_enabled = server.aof_state != AOF_OFF;
 
+        /* Ensure background save doesn't overwrite synced data */
+        if (server.rdb_child_pid != -1) {
+            serverLog(LL_NOTICE,
+                "Replica is about to load the RDB file received from the "
+                "master, but there is a pending RDB child running. "
+                "Killing process %ld and removing its temp file to avoid "
+                "any race",
+                    (long) server.rdb_child_pid);
+            killRDBChild();
+        }
+
         if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
-            serverLog(LL_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> REPLICA synchronization: %s", strerror(errno));
+            serverLog(LL_WARNING,"Failed trying to rename the temp DB into %s in MASTER <-> REPLICA synchronization: %s", 
+			    server.rdb_filename, strerror(errno));
             cancelReplicationHandshake();
             return;
         }
@@ -1271,7 +1293,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
             cancelReplicationHandshake();
             /* Re-enable the AOF if we disabled it earlier, in order to restore
              * the original configuration. */
-            if (aof_is_enabled) restartAOF();
+            if (aof_is_enabled) restartAOFAfterSYNC();
             return;
         }
         /* Final setup of the connected slave <- master link */
@@ -1296,7 +1318,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
         /* Restart the AOF subsystem now that we finished the sync. This
          * will trigger an AOF rewrite, and when done will start appending
          * to the new file. */
-        if (aof_is_enabled) restartAOF();
+        if (aof_is_enabled) restartAOFAfterSYNC();
     }
     return;
 
@@ -1648,7 +1670,13 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     /* AUTH with the master if required. */
     if (server.repl_state == REPL_STATE_SEND_AUTH) {
-        if (server.masterauth) {
+        if (server.masteruser && server.masterauth) {
+            err = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"AUTH",
+                                         server.masteruser,server.masterauth,NULL);
+            if (err) goto write_error;
+            server.repl_state = REPL_STATE_RECEIVE_AUTH;
+            return;
+        } else if (server.masterauth) {
             err = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"AUTH",server.masterauth,NULL);
             if (err) goto write_error;
             server.repl_state = REPL_STATE_RECEIVE_AUTH;
@@ -2019,14 +2047,26 @@ void replicaofCommand(client *c) {
     } else {
         long port;
 
+        if (c->flags & CLIENT_SLAVE)
+        {
+            /* If a client is already a replica they cannot run this command,
+             * because it involves flushing all replicas (including this
+             * client) */
+            addReplyError(c, "Command is not valid when client is a replica.");
+            return;
+        }
+
         if ((getLongFromObjectOrReply(c, c->argv[2], &port, NULL) != C_OK))
             return;
 
         /* Check if we are already attached to the specified slave */
         if (server.masterhost && !strcasecmp(server.masterhost,c->argv[1]->ptr)
             && server.masterport == port) {
-            serverLog(LL_NOTICE,"REPLICAOF would result into synchronization with the master we are already connected with. No operation performed.");
-            addReplySds(c,sdsnew("+OK Already connected to specified master\r\n"));
+            serverLog(LL_NOTICE,"REPLICAOF would result into synchronization "
+                                "with the master we are already connected "
+                                "with. No operation performed.");
+            addReplySds(c,sdsnew("+OK Already connected to specified "
+                                 "master\r\n"));
             return;
         }
         /* There was no previous master or the user specified a different one,
@@ -2050,10 +2090,10 @@ void roleCommand(client *c) {
         void *mbcount;
         int slaves = 0;
 
-        addReplyMultiBulkLen(c,3);
+        addReplyArrayLen(c,3);
         addReplyBulkCBuffer(c,"master",6);
         addReplyLongLong(c,server.master_repl_offset);
-        mbcount = addDeferredMultiBulkLength(c);
+        mbcount = addReplyDeferredLen(c);
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             client *slave = ln->value;
@@ -2065,17 +2105,17 @@ void roleCommand(client *c) {
                 slaveip = ip;
             }
             if (slave->replstate != SLAVE_STATE_ONLINE) continue;
-            addReplyMultiBulkLen(c,3);
+            addReplyArrayLen(c,3);
             addReplyBulkCString(c,slaveip);
             addReplyBulkLongLong(c,slave->slave_listening_port);
             addReplyBulkLongLong(c,slave->repl_ack_off);
             slaves++;
         }
-        setDeferredMultiBulkLength(c,mbcount,slaves);
+        setDeferredArrayLen(c,mbcount,slaves);
     } else {
         char *slavestate = NULL;
 
-        addReplyMultiBulkLen(c,5);
+        addReplyArrayLen(c,5);
         addReplyBulkCBuffer(c,"slave",5);
         addReplyBulkCString(c,server.masterhost);
         addReplyLongLong(c,server.masterport);
@@ -2104,7 +2144,7 @@ void replicationSendAck(void) {
 
     if (c != NULL) {
         c->flags |= CLIENT_MASTER_FORCE_REPLY;
-        addReplyMultiBulkLen(c,3);
+        addReplyArrayLen(c,3);
         addReplyBulkCString(c,"REPLCONF");
         addReplyBulkCString(c,"ACK");
         addReplyBulkLongLong(c,c->reploff);
